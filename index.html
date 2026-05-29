@@ -1,0 +1,1533 @@
+<!--
+================================================================================
+  SLEEP QUALITY REPORT — Developer Notes
+================================================================================
+
+  PURPOSE
+  -------
+  A self-contained, single-file HTML tool that converts 1-second-resolution
+  heart rate CSV data (exported from a Polar or compatible heart rate monitor
+  during sleep) into a structured sleep benchmark report. No server, no
+  dependencies, no data leaves the browser.
+
+  INPUT FORMAT
+  ------------
+  A CSV file with a metadata header section (ignored) followed by a data
+  section beginning with a row that has "Time" and "HR" column headers.
+  Expected columns: Sample rate, Time (HH:MM:SS), HR (bpm), ...
+  Each subsequent row represents one second of recording.
+  Example export: Polar Flow CSV, "Other Indoor" activity type.
+
+  THE 6 METRICS (computed in the `calculate()` function)
+  -------------------------------------------------------
+  1. TRHR  – True Resting Heart Rate
+             Lowest 10-minute rolling average of per-minute median HR,
+             evaluated only within the detected sleep window.
+
+  2. SD    – Sleep Duration (hours)
+             Time elapsed from sleep start to sleep end.
+             Sleep START: first run of 10 consecutive minutes where
+               per-minute median HR < 60 BPM.
+             Sleep END: first minute (>60 min after start) where the
+               10-minute rolling average of median HR exceeds 75 BPM.
+               FALLBACK: if no wake signal is detected (e.g. recording ended
+               at wake-up, or a very calm arousal below 75 BPM), the last
+               recorded minute is used as sleep end and the report is flagged
+               with "END ESTIMATED · recording cutoff".
+
+  3. AvgSHR – Average Sleep Heart Rate
+              Mean of every raw 1-second HR reading within the sleep window.
+
+  4. ST    – Sleep Turbulence (event count)
+             Number of distinct spike events where a minute's max HR exceeds
+             (overall sleep median HR + 20 BPM). Consecutive spiking minutes
+             count as a single event.
+
+  5. MHRP  – Min HR Percentage
+             Percentage of sleep duration (SD) spent at or below TRHR + 5 BPM.
+             IMPORTANT: counts ALL seconds in the entire recording (not just
+             the sleep window) that meet the threshold, then divides by SD.
+             Formula: (total qualifying seconds across full recording / 3600) / SD × 100
+
+  6. MHD   – Min HR Duration (hours)
+             Total hours (across the full recording) where HR ≤ TRHR + 5 BPM.
+             Formula: total qualifying seconds / 3600
+
+  BENCHMARKS
+  ----------
+  Defined in the `BENCHMARKS` array. Each entry carries:
+    base   – average / typical value
+    target – personal best / optimal value
+  Colour ratings are computed per-metric (see `rateValue()`) based on
+  thresholds relative to the target value or fixed clinical ranges.
+
+  COLOUR CODING RULES (see `rateValue()`)
+  ----------------------------------------
+  TRHR    : green  < target × 110%
+            orange >= target × 110%
+            red    >= target × 115%
+  SD      : green  > 8 h
+            orange 7–8 h
+            red    < 7 h
+  AvgSHR  : green  < target × 110%
+            orange >= target × 110%
+            red    >= target × 120%
+  ST      : green  < 35 events
+            orange 35–50 events
+            red    > 50 events
+  MHRP    : green  >= 60%
+            orange >= 40%
+            red    < 40%
+  MHD     : derived from the BENCHMARKS base/target range (generic fallback)
+
+  FILE STRUCTURE
+  --------------
+  • <style>   — All CSS, dark theme, DM Serif / DM Sans / DM Mono fonts
+  • <body>    — Drop zone UI, processing spinner, report output
+  • <script>  — BENCHMARKS array, file handling, calculate(), renderReport()
+
+  TO UPDATE BENCHMARKS
+  --------------------
+  Edit the `BENCHMARKS` array constants near the top of the <script> block.
+  To change personal bests (target) or averages (base), update those fields.
+  Colour thresholds are in `rateValue()` — update the switch cases there.
+
+================================================================================
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sleep Quality Report</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2330;
+    --border: #2a3441;
+    --text: #e6edf3;
+    --text-muted: #7d8590;
+    --text-dim: #4a5568;
+    --gold: #d4a853;
+    --gold-dim: #8a6a2e;
+    --green: #3fb950;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --accent: #c9a227;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px;
+  }
+
+  /* Grain texture overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.5;
+  }
+
+  .container {
+    width: 100%;
+    max-width: 860px;
+    position: relative;
+    z-index: 1;
+  }
+
+  /* Header */
+  .header {
+    text-align: center;
+    margin-bottom: 48px;
+    animation: fadeDown 0.6s ease both;
+  }
+
+  .header-eyebrow {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin-bottom: 12px;
+  }
+
+  .header h1 {
+    font-family: 'DM Serif Display', serif;
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    font-weight: 400;
+    color: var(--text);
+    line-height: 1.1;
+    margin-bottom: 8px;
+  }
+
+  .header h1 em {
+    font-style: italic;
+    color: var(--gold);
+  }
+
+  .header-sub {
+    font-size: 13px;
+    color: var(--text-muted);
+    font-weight: 300;
+    margin-top: 10px;
+  }
+
+  /* Drop Zone */
+  .drop-zone {
+    border: 1.5px dashed var(--border);
+    border-radius: 16px;
+    padding: 52px 40px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.25s ease;
+    background: var(--surface);
+    position: relative;
+    overflow: hidden;
+    animation: fadeUp 0.6s 0.1s ease both;
+  }
+
+  .drop-zone::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse at 50% 0%, rgba(212,168,83,0.06) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color: var(--gold-dim);
+    background: var(--surface2);
+    transform: translateY(-2px);
+    box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+  }
+
+  .drop-zone.drag-over {
+    border-color: var(--gold);
+    box-shadow: 0 0 0 1px var(--gold-dim), 0 12px 40px rgba(0,0,0,0.4);
+  }
+
+  .drop-icon {
+    width: 48px;
+    height: 48px;
+    margin: 0 auto 16px;
+    opacity: 0.5;
+  }
+
+  .drop-title {
+    font-family: 'DM Serif Display', serif;
+    font-size: 1.4rem;
+    font-weight: 400;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+
+  .drop-sub {
+    font-size: 13px;
+    color: var(--text-muted);
+    font-weight: 300;
+  }
+
+  .drop-sub span {
+    color: var(--gold);
+    font-weight: 400;
+  }
+
+  #fileInput { display: none; }
+
+  /* Processing State */
+  .processing {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    padding: 48px;
+    animation: fadeUp 0.3s ease both;
+  }
+
+  .spinner {
+    width: 36px;
+    height: 36px;
+    border: 2px solid var(--border);
+    border-top-color: var(--gold);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  .processing-text {
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+    letter-spacing: 0.1em;
+  }
+
+  /* Report */
+  .report {
+    display: none;
+    animation: fadeUp 0.5s ease both;
+  }
+
+  .report-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin-bottom: 32px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+
+  .report-title-block {}
+  .report-title-block .eyebrow {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+  .report-title-block h2 {
+    font-family: 'DM Serif Display', serif;
+    font-size: 1.6rem;
+    font-weight: 400;
+    color: var(--text);
+  }
+
+  .report-meta {
+    text-align: right;
+  }
+  .report-meta .file-name {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: var(--gold);
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+  }
+  .report-meta .report-date {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  /* Score pills */
+  .score-row {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 32px;
+    flex-wrap: wrap;
+  }
+
+  .score-pill {
+    flex: 1;
+    min-width: 140px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 20px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .score-pill::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--pill-color, var(--border));
+  }
+
+  .score-pill.good { --pill-color: var(--green); }
+  .score-pill.warn { --pill-color: var(--gold); }
+  .score-pill.bad  { --pill-color: var(--red); }
+
+  .score-pill-label {
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    font-family: 'DM Mono', monospace;
+  }
+
+  .score-pill-value {
+    font-family: 'DM Mono', monospace;
+    font-size: 1.6rem;
+    font-weight: 500;
+    color: var(--text);
+    line-height: 1;
+  }
+
+  .score-pill-unit {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 4px;
+  }
+
+  /* Table */
+  .table-wrap {
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    margin-bottom: 24px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  thead {
+    background: var(--surface2);
+  }
+
+  thead th {
+    padding: 14px 20px;
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+
+  thead th:not(:first-child) {
+    text-align: right;
+  }
+
+  tbody tr {
+    border-bottom: 1px solid var(--border);
+    transition: background 0.15s;
+  }
+
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: var(--surface); }
+
+  tbody td {
+    padding: 18px 20px;
+    vertical-align: middle;
+  }
+
+  .td-metric {
+    font-size: 14px;
+    font-weight: 400;
+    color: var(--text);
+  }
+
+  .td-metric small {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 300;
+    margin-top: 2px;
+    font-family: 'DM Mono', monospace;
+  }
+
+  .td-num {
+    text-align: right;
+    font-family: 'DM Mono', monospace;
+    font-size: 14px;
+    color: var(--text-muted);
+  }
+
+  .td-today {
+    text-align: right;
+    font-family: 'DM Mono', monospace;
+    font-size: 15px;
+    font-weight: 500;
+  }
+
+  .val-good { color: var(--green); }
+  .val-warn { color: var(--gold); }
+  .val-bad  { color: var(--red); }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
+    font-family: 'DM Mono', monospace;
+    padding: 2px 8px;
+    border-radius: 100px;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+
+  .badge.good { background: rgba(63,185,80,0.1); color: var(--green); }
+  .badge.warn { background: rgba(212,168,83,0.1); color: var(--gold); }
+  .badge.bad  { background: rgba(248,81,73,0.1);  color: var(--red);  }
+
+  /* Footer */
+  .report-footer {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--text-dim);
+    text-align: center;
+    padding-top: 20px;
+    letter-spacing: 0.08em;
+    line-height: 1.8;
+  }
+
+  .btn-reset {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 20px;
+    padding: 10px 24px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-muted);
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-transform: uppercase;
+  }
+  .btn-reset:hover {
+    border-color: var(--gold-dim);
+    color: var(--gold);
+    background: rgba(212,168,83,0.05);
+  }
+
+  /* Error */
+  .error-box {
+    display: none;
+    background: rgba(248,81,73,0.07);
+    border: 1px solid rgba(248,81,73,0.3);
+    border-radius: 10px;
+    padding: 20px 24px;
+    font-size: 13px;
+    color: #ff7b72;
+    line-height: 1.6;
+    margin-top: 16px;
+  }
+
+  /* Animations */
+  @keyframes fadeDown {
+    from { opacity: 0; transform: translateY(-16px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  /* Chart */
+  .chart-section {
+    margin-top: 32px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 20px 20px;
+    margin-bottom: 24px;
+  }
+
+  .chart-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .chart-title {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .chart-legend {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+
+  .chart-legend span { display: flex; align-items: center; gap: 5px; }
+
+  .legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+
+  .chart-wrap {
+    position: relative;
+    width: 100%;
+  }
+
+  #hrChart {
+    width: 100%;
+    height: 200px;
+    display: block;
+    border-radius: 6px;
+  }
+
+  .chart-sleep-note {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--text-dim);
+    text-align: center;
+    margin-top: 10px;
+    letter-spacing: 0.06em;
+  }
+
+  @media (max-width: 600px) {
+    .td-num { display: none; }
+    thead th:nth-child(2), thead th:nth-child(3) { display: none; }
+    tbody td { padding: 14px 12px; }
+    .td-metric { font-size: 13px; }
+    .td-today  { font-size: 13px; }
+    .badge { display: block; margin: 4px 0 0 0; font-size: 9px; }
+    .score-pill { min-width: 100px; padding: 12px 14px; }
+    .score-pill-value { font-size: 1.3rem; }
+    .recent-report-pills { display: none; }
+  }
+  @media print {
+    body { background: white; color: black; }
+    .drop-zone, .btn-reset, .processing, .recent-reports { display: none !important; }
+    .report { display: block !important; }
+    .table-wrap { border-color: #ccc; }
+    tbody tr:hover { background: transparent; }
+  }
+
+  /* Recent Reports */
+  .recent-reports {
+    margin-top: 20px;
+    animation: fadeUp 0.5s 0.2s ease both;
+  }
+
+  .recent-reports-title {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+    padding-left: 2px;
+  }
+
+  .recent-report-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 13px 18px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+    gap: 16px;
+  }
+
+  .recent-report-item:hover {
+    border-color: var(--gold-dim);
+    background: var(--surface2);
+    transform: translateX(2px);
+  }
+
+  .recent-report-left {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .recent-report-name {
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    color: var(--gold);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .recent-report-date {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+
+  .recent-report-pills {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .recent-mini-pill {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 100px;
+    border: 1px solid transparent;
+  }
+
+  .recent-mini-pill.good { background: rgba(63,185,80,0.1);  color: var(--green); border-color: rgba(63,185,80,0.2); }
+  .recent-mini-pill.warn { background: rgba(212,168,83,0.1); color: var(--gold);  border-color: rgba(212,168,83,0.2); }
+  .recent-mini-pill.bad  { background: rgba(248,81,73,0.1);  color: var(--red);   border-color: rgba(248,81,73,0.2); }
+
+  .recent-report-arrow {
+    color: var(--text-dim);
+    font-size: 14px;
+    flex-shrink: 0;
+    transition: color 0.2s;
+  }
+
+  .recent-report-item:hover .recent-report-arrow {
+    color: var(--gold);
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-eyebrow">Personal Health Analytics</div>
+    <h1>Sleep Quality <em>Report V9</em></h1>
+    <div class="header-sub">Drop your morning heart rate CSV to generate a consistent sleep benchmark report</div>
+  </div>
+
+  <!-- Drop Zone -->
+  <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+    <svg class="drop-icon" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M24 4L24 32M24 4L14 14M24 4L34 14" stroke="#d4a853" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M8 36V40C8 42.2 9.8 44 12 44H36C38.2 44 40 42.2 40 40V36" stroke="#7d8590" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <div class="drop-title">Drop your CSV file here</div>
+    <div class="drop-sub">or click to browse &nbsp;·&nbsp; <span>Works 100% offline in your browser</span></div>
+    <input type="file" id="fileInput">
+  </div>
+
+  <!-- Recent Reports -->
+  <div id="recentReports" style="display:none" class="recent-reports">
+    <div class="recent-reports-title">Recent Reports</div>
+    <div id="recentReportsList"></div>
+  </div>
+
+  <div class="error-box" id="errorBox"></div>
+
+  <!-- Processing -->
+  <div class="processing" id="processingDiv">
+    <div class="spinner"></div>
+    <div class="processing-text" id="processingText">PARSING HEART RATE DATA...</div>
+  </div>
+
+  <!-- Report -->
+  <div class="report" id="reportDiv">
+
+    <div class="report-header">
+      <div class="report-title-block">
+        <div class="eyebrow">Generated Report</div>
+        <h2>Sleep Benchmarks</h2>
+      </div>
+      <div class="report-meta">
+        <div class="file-name" id="rFileName">—</div>
+        <div class="report-date" id="rDate">—</div>
+      </div>
+    </div>
+
+    <!-- Quick stats row -->
+    <div class="score-row" id="scoreRow"></div>
+
+    <!-- Main table -->
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Base Value (Avg)</th>
+            <th>Best Value (Target)</th>
+            <th>Today's Value</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+
+    <div class="report-footer" id="reportFooter"></div>
+
+    <!-- HR Chart -->
+    <div class="chart-section">
+      <div class="chart-header">
+        <div class="chart-title">Heart Rate — Full Recording</div>
+        <div class="chart-legend">
+          <span class="legend-dot" style="background:#3fb950"></span><span>≤ 50 BPM</span>
+          <span class="legend-dot" style="background:#d4a853"></span><span>51–65 BPM</span>
+          <span class="legend-dot" style="background:#f85149"></span><span>&gt; 65 BPM</span>
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="hrChart"></canvas>
+        <div class="chart-y-labels" id="chartYLabels"></div>
+        <div class="chart-x-labels" id="chartXLabels"></div>
+      </div>
+      <div class="chart-sleep-note" id="chartSleepNote"></div>
+    </div>
+
+    <div style="text-align:center">
+      <button class="btn-reset" onclick="resetTool()">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M1 8C1 4.13 4.13 1 8 1c2.4 0 4.5 1.13 5.87 2.87M15 8c0 3.87-3.13 7-7 7-2.4 0-4.5-1.13-5.87-2.87" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M12 1l2 4-4 0" fill="currentColor"/><path d="M4 15L2 11l4 0" fill="currentColor"/></svg>
+        Load another file
+      </button>
+    </div>
+
+  </div><!-- /report -->
+
+</div><!-- /container -->
+
+<script>
+// ─── BENCHMARK DEFINITIONS ────────────────────────────────────────────────────
+const BENCHMARKS = [
+  {
+    metric: "True Resting Heart Rate",
+    abbr: "TRHR",
+    base: 52, target: 47, unit: "BPM",
+    better: "lower",
+    desc: "Lowest 10-min rolling average of median HR during sleep"
+  },
+  {
+    metric: "Sleep Duration",
+    abbr: "SD",
+    base: 7.5, target: 8.5, unit: "hrs",
+    better: "higher",
+    desc: "Time from HR first dropping below 60 until it rises above 60"
+  },
+  {
+    metric: "Average Sleep Heart Rate",
+    abbr: "AvgSHR",
+    base: 60, target: 54, unit: "BPM",
+    better: "lower",
+    desc: "Mean of all heart rate readings within the sleep window"
+  },
+  {
+    metric: "Sleep Turbulence",
+    abbr: "ST",
+    base: 40, target: 20, unit: "events",
+    better: "lower",
+    desc: "Distinct spikes where per-minute max HR exceeds sleep median + 20 BPM"
+  },
+  {
+    metric: "Min HR Percentage",
+    abbr: "MHRP",
+    base: 50, target: 65, unit: "%",
+    better: "higher",
+    desc: "Percentage of sleep time spent below TRHR + 5 BPM"
+  },
+  {
+    metric: "Min HR Duration",
+    abbr: "MHD",
+    base: 4, target: 5.2, unit: "hrs",
+    better: "higher",
+    desc: "Sleep Duration × Min HR Percentage"
+  }
+];
+
+// ─── FILE HANDLING ─────────────────────────────────────────────────────────────
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const f = e.dataTransfer.files[0];
+  if (f) processFile(f);
+});
+fileInput.addEventListener('change', e => { if (e.target.files[0]) processFile(e.target.files[0]); });
+
+function showError(msg) {
+  const el = document.getElementById('errorBox');
+  el.innerHTML = '⚠️ ' + msg;
+  el.style.display = 'block';
+  document.getElementById('processingDiv').style.display = 'none';
+}
+
+function setProcessing(show, text) {
+  const el = document.getElementById('processingDiv');
+  el.style.display = show ? 'flex' : 'none';
+  if (text) document.getElementById('processingText').textContent = text;
+}
+
+function resetTool() {
+  document.getElementById('reportDiv').style.display = 'none';
+  document.getElementById('errorBox').style.display  = 'none';
+  document.getElementById('dropZone').style.display  = 'block';
+  fileInput.value = '';
+
+  // Restore chart section in case it was replaced by a stored-report placeholder
+  const chartSection = document.querySelector('.chart-section');
+  if (chartSection && !chartSection.querySelector('#hrChart')) {
+    chartSection.innerHTML = `
+      <div class="chart-header">
+        <div class="chart-title">Heart Rate — Full Recording</div>
+        <div class="chart-legend">
+          <span class="legend-dot" style="background:#3fb950"></span><span>≤ 50 BPM</span>
+          <span class="legend-dot" style="background:#d4a853"></span><span>51–65 BPM</span>
+          <span class="legend-dot" style="background:#f85149"></span><span>&gt; 65 BPM</span>
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="hrChart"></canvas>
+        <div class="chart-y-labels" id="chartYLabels"></div>
+        <div class="chart-x-labels" id="chartXLabels"></div>
+      </div>
+      <div class="chart-sleep-note" id="chartSleepNote"></div>`;
+  }
+
+  loadRecentReports();
+}
+
+function processFile(file) {
+  document.getElementById('errorBox').style.display = 'none';
+  document.getElementById('dropZone').style.display = 'none';
+  setProcessing(true, 'READING FILE…');
+
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      setProcessing(true, 'PARSING HEART RATE DATA…');
+      setTimeout(() => {
+        try {
+          const results = calculate(e.target.result, file.name);
+          setProcessing(false);
+          renderReport(results, file.name);
+        } catch(err) {
+          showError('Calculation error: ' + err.message);
+        }
+      }, 30);
+    } catch(err) {
+      showError('Parse error: ' + err.message);
+    }
+  };
+  reader.onerror = () => showError('Could not read file.');
+  reader.readAsText(file);
+}
+
+// ─── CORE CALCULATION ENGINE ───────────────────────────────────────────────────
+function calculate(csvText, filename) {
+  // 1. Parse CSV — skip header rows until we find "Time" + "HR" columns
+  const lines = csvText.split('\n');
+  let dataStart = -1;
+  let timeCol = -1, hrCol = -1;
+
+  for (let i = 0; i < Math.min(10, lines.length); i++) {
+    const cols = lines[i].split(',');
+    const timeIdx = cols.findIndex(c => c.trim().toLowerCase() === 'time');
+    const hrIdx   = cols.findIndex(c => c.trim().toLowerCase().startsWith('hr'));
+    if (timeIdx >= 0 && hrIdx >= 0) {
+      dataStart = i + 1;
+      timeCol = timeIdx;
+      hrCol = hrIdx;
+      break;
+    }
+  }
+
+  if (dataStart < 0) throw new Error('Could not find Time/HR columns in file. Ensure it is an unmodified export.');
+
+  // 2. Build seconds-level array
+  const secData = []; // [{seconds, hr}]
+  for (let i = dataStart; i < lines.length; i++) {
+    const cols = lines[i].split(',');
+    if (!cols[timeCol] || !cols[hrCol]) continue;
+    const tStr = cols[timeCol].trim();
+    const hrVal = parseFloat(cols[hrCol].trim());
+    if (isNaN(hrVal) || !tStr.includes(':')) continue;
+    const parts = tStr.split(':').map(Number);
+    if (parts.length < 3) continue;
+    const seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    secData.push({ seconds, hr: hrVal });
+  }
+
+  if (secData.length < 100) throw new Error('Less than 100 data points found. Check the file format.');
+
+  secData.sort((a, b) => a.seconds - b.seconds);
+
+  // 3. Build per-minute aggregates
+  const minMap = new Map();
+  for (const {seconds, hr} of secData) {
+    const m = Math.floor(seconds / 60);
+    if (!minMap.has(m)) minMap.set(m, []);
+    minMap.get(m).push(hr);
+  }
+
+  const minutes = [];
+  for (const [m, hrs] of [...minMap.entries()].sort((a,b) => a[0]-b[0])) {
+    hrs.sort((a,b) => a-b);
+    const n = hrs.length;
+    const minH  = hrs[0];
+    const maxH  = hrs[n-1];
+    const medH  = n % 2 === 0 ? (hrs[n/2-1] + hrs[n/2]) / 2 : hrs[Math.floor(n/2)];
+    const avgH  = hrs.reduce((s,v) => s+v, 0) / n;
+    minutes.push({ minute: m, min_hr: minH, max_hr: maxH, median_hr: medH, mean_hr: avgH });
+  }
+
+  // 4. Sleep window detection
+  // SLEEP START: 10 consecutive minutes where median_hr < 60
+  // SLEEP END:   10-minute rolling average of median_hr > 75
+  // Using median (not min) for both — median is robust against brief sensor spikes.
+  // Using rolling average for end (not consecutive threshold) — allows the HR to dip
+  // briefly mid-wake without resetting, while light-sleep phases (~65–68 med) can
+  // never push a 10-min rolling average above 75.
+  const SLEEP_START_THRESH = 60;
+  const SLEEP_END_THRESH   = 75;
+  const CONSEC = 10;
+
+  let sleepStartMin = null, sleepEndMin = null;
+
+  // Sleep START: first run of 10 consecutive minutes with median_hr < 60
+  for (let i = 0; i <= minutes.length - CONSEC; i++) {
+    if (minutes.slice(i, i + CONSEC).every(m => m.median_hr < SLEEP_START_THRESH)) {
+      sleepStartMin = minutes[i].minute;
+      break;
+    }
+  }
+
+  if (sleepStartMin === null) throw new Error('Could not detect sleep start — median HR never stayed below 60 BPM for 10 consecutive minutes.');
+
+  // Sleep END: first minute (>60min after start) where 10-minute rolling average
+  // of median_hr > 75. Rolling average prevents brief REM/movement spikes from
+  // triggering a false end — genuine waking sustains high HR across the window.
+  const afterSleep = minutes.filter(m => m.minute > sleepStartMin + 60);
+  for (let i = 0; i <= afterSleep.length - CONSEC; i++) {
+    const avg = afterSleep.slice(i, i + CONSEC).reduce((s, m) => s + m.median_hr, 0) / CONSEC;
+    if (avg > SLEEP_END_THRESH) {
+      sleepEndMin = afterSleep[i].minute;
+      break;
+    }
+  }
+
+  let sleepEndEstimated = false;
+  if (sleepEndMin === null) {
+    // Fallback: use the last recorded minute as sleep end.
+    // This happens when the recording ends before HR sustains above the wake
+    // threshold (e.g. monitor stopped at wake-up, or a very calm arousal).
+    sleepEndMin = minutes[minutes.length - 1].minute;
+    sleepEndEstimated = true;
+  }
+
+  // 5. Slice to sleep window
+  const sleepSec  = secData.filter(d => d.seconds >= sleepStartMin * 60 && d.seconds < sleepEndMin * 60);
+  const sleepMins = minutes.filter(m => m.minute >= sleepStartMin && m.minute < sleepEndMin);
+
+  if (sleepSec.length < 10) throw new Error('Sleep window contains too few data points.');
+
+  // ── METRIC 1: TRHR ──
+  // Lowest 10-minute rolling average of per-minute median HR
+  let trhr = Infinity;
+  for (let i = 0; i <= sleepMins.length - 10; i++) {
+    const avg = sleepMins.slice(i, i + 10).reduce((s, m) => s + m.median_hr, 0) / 10;
+    if (avg < trhr) trhr = avg;
+  }
+
+  // ── METRIC 2: SD ──
+  const sd = (sleepEndMin - sleepStartMin) / 60;
+
+  // ── METRIC 3: Avg Sleep HR ──
+  const avgSleepHR = sleepSec.reduce((s, d) => s + d.hr, 0) / sleepSec.length;
+
+  // ── METRIC 4: Sleep Turbulence ──
+  // Overall sleep median (all seconds)
+  const sorted = [...sleepSec].map(d => d.hr).sort((a,b) => a-b);
+  const n = sorted.length;
+  const sleepMedian = n % 2 === 0 ? (sorted[n/2-1] + sorted[n/2]) / 2 : sorted[Math.floor(n/2)];
+  const spikeThresh = sleepMedian + 20;
+
+  // Count distinct consecutive-minute spike events
+  let turbulence = 0;
+  let inSpike = false;
+  for (const m of sleepMins) {
+    const isSpike = m.max_hr > spikeThresh;
+    if (isSpike && !inSpike) { turbulence++; inSpike = true; }
+    else if (!isSpike) { inSpike = false; }
+  }
+
+  // ── METRIC 6: MHD ──
+  // Count ALL seconds in the ENTIRE recording (not just sleep window)
+  // where HR <= TRHR + 5. This captures qualifying time outside the
+  // detected sleep window (e.g. pre-sleep stillness, brief wake periods).
+  const mhrpThresh = trhr + 5;
+  const belowCountAll = secData.filter(d => d.hr <= mhrpThresh).length;
+  const mhd = belowCountAll / 3600; // total qualifying hours across full recording
+
+  // ── METRIC 5: MHRP ──
+  // Percentage of sleep duration (SD) represented by MHD
+  const mhrp = (mhd / sd) * 100;
+
+  return {
+    trhr: Math.round(trhr * 10) / 10,
+    sd: Math.round(sd * 100) / 100,
+    avgSleepHR: Math.round(avgSleepHR * 10) / 10,
+    turbulence,
+    mhrp: Math.round(mhrp * 10) / 10,
+    mhd: Math.round(mhd * 100) / 100,
+    sleepMedian: Math.round(sleepMedian * 10) / 10,
+    spikeThresh: Math.round(spikeThresh * 10) / 10,
+    mhrpThresh: Math.round(mhrpThresh * 10) / 10,
+    sleepStartSec: sleepStartMin * 60,
+    sleepEndSec: sleepEndMin * 60,
+    sleepEndEstimated,
+    totalPoints: secData.length,
+    secData
+  };
+}
+
+// ─── RENDER ────────────────────────────────────────────────────────────────────
+function rateValue(val, bm, index) {
+  switch (index) {
+    case 0: // TRHR — lower is better; thresholds relative to target (best) value
+      if (val < bm.target * 1.10) return 'good';
+      if (val < bm.target * 1.15) return 'warn';
+      return 'bad';
+    case 1: // Sleep Duration — fixed hour thresholds
+      if (val > 8)  return 'good';
+      if (val >= 7) return 'warn';
+      return 'bad';
+    case 2: // Average Sleep HR — lower is better; thresholds relative to target
+      if (val < bm.target * 1.10) return 'good';
+      if (val < bm.target * 1.20) return 'warn';
+      return 'bad';
+    case 3: // Sleep Turbulence — fixed event count thresholds
+      if (val < 35)  return 'good';
+      if (val <= 50) return 'warn';
+      return 'bad';
+    case 4: // Min HR Percentage — fixed percentage thresholds
+      if (val >= 60) return 'good';
+      if (val >= 40) return 'warn';
+      return 'bad';
+    default: // Min HR Duration — generic base/target range
+      const mid = (bm.base + bm.target) / 2;
+      if (val >= bm.target) return 'good';
+      if (val >= mid)       return 'warn';
+      return 'bad';
+  }
+}
+
+function fmtVal(val, unit) {
+  if (unit === '%') return val.toFixed(1) + '%';
+  if (unit === 'hrs') return val.toFixed(2) + ' h';
+  if (unit === 'events') return String(Math.round(val));
+  return val.toFixed(1);
+}
+
+function renderReport(res, filename) {
+  const values = [res.trhr, res.sd, res.avgSleepHR, res.turbulence, res.mhrp, res.mhd];
+
+  // Header
+  document.getElementById('rFileName').textContent = filename;
+  document.getElementById('rDate').textContent = new Date().toLocaleDateString('en-GB', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+  });
+
+  // Score pills (key 4)
+  const pillKeys = [0, 1, 2, 3]; // TRHR, SD, AvgSHR, Turbulence
+  const scoreRow = document.getElementById('scoreRow');
+  scoreRow.innerHTML = '';
+  for (const i of pillKeys) {
+    const bm = BENCHMARKS[i];
+    const v  = values[i];
+    const cls = rateValue(v, bm, i);
+    const pill = document.createElement('div');
+    pill.className = `score-pill ${cls}`;
+    pill.innerHTML = `
+      <div class="score-pill-label">${bm.abbr}</div>
+      <div class="score-pill-value">${bm.unit === '%' ? v.toFixed(1) : bm.unit === 'hrs' ? v.toFixed(2) : bm.unit === 'events' ? Math.round(v) : v.toFixed(1)}</div>
+      <div class="score-pill-unit">${bm.unit}</div>
+    `;
+    scoreRow.appendChild(pill);
+  }
+
+  // Table
+  const tbody = document.getElementById('tableBody');
+  tbody.innerHTML = '';
+  BENCHMARKS.forEach((bm, i) => {
+    const v   = values[i];
+    const cls = rateValue(v, bm, i);
+    const label = cls === 'good' ? '✓ On Target' : cls === 'warn' ? '△ Near Avg' : '✗ Below Avg';
+    const disp = fmtVal(v, bm.unit);
+    const baseDisp   = fmtVal(bm.base,   bm.unit);
+    const targetDisp = fmtVal(bm.target, bm.unit);
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="td-metric">${bm.metric}<small>${bm.desc}</small></td>
+      <td class="td-num">${baseDisp}</td>
+      <td class="td-num">${targetDisp}</td>
+      <td class="td-today val-${cls}">${disp}<span class="badge ${cls}">${label}</span></td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  // Footer — calculation notes
+  const fmtTime = s => {
+    const h = Math.floor(s/3600).toString().padStart(2,'0');
+    const m = Math.floor((s%3600)/60).toString().padStart(2,'0');
+    const sec = (s%60).toString().padStart(2,'0');
+    return `${h}:${m}:${sec}`;
+  };
+  document.getElementById('reportFooter').innerHTML = `
+    Sleep window detected: ${fmtTime(res.sleepStartSec)} → ${fmtTime(res.sleepEndSec)}${res.sleepEndEstimated ? ' <span style="color:var(--gold);font-size:9px;letter-spacing:0.08em;background:rgba(212,168,83,0.1);padding:1px 6px;border-radius:4px;border:1px solid rgba(212,168,83,0.25);">END ESTIMATED · recording cutoff</span>' : ''}<br>
+    Sleep median HR: ${res.sleepMedian} BPM &nbsp;·&nbsp; Turbulence threshold: ${res.spikeThresh} BPM &nbsp;·&nbsp; MHRP threshold (TRHR+5): ${res.mhrpThresh} BPM<br>
+    Total data points analysed: ${res.totalPoints.toLocaleString()} seconds
+  `;
+
+  document.getElementById('reportDiv').style.display = 'block';
+
+  // Draw chart after layout is visible, then save to storage
+  requestAnimationFrame(() => {
+    renderChart(res);
+
+    // Downsample secData to 600 pts for storage (keeps JSONBin payload small)
+    const STORE_PTS = 600;
+    const step = Math.max(1, Math.floor(res.secData.length / STORE_PTS));
+    const sampledData = res.secData.filter((_, i) => i % step === 0);
+
+    saveReportToStorage({
+      filename,
+      date: document.getElementById('rDate').textContent,
+      values,
+      footerHTML: document.getElementById('reportFooter').innerHTML,
+      chartData: {
+        secData:       sampledData,
+        sleepStartSec: res.sleepStartSec,
+        sleepEndSec:   res.sleepEndSec
+      }
+    }).then(() => loadRecentReports());
+  });
+}
+
+// ─── CHART ─────────────────────────────────────────────────────────────────────
+function renderChart(res) {
+  const canvas = document.getElementById('hrChart');
+  const data   = res.secData;
+  if (!canvas || !data || data.length === 0) return;
+
+  const dpr  = window.devicePixelRatio || 1;
+  const W    = canvas.offsetWidth  || canvas.parentElement.offsetWidth;
+  const H    = 200;
+  canvas.width  = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  // Padding
+  const PAD_L = 36, PAD_R = 12, PAD_T = 10, PAD_B = 28;
+  const cW = W - PAD_L - PAD_R;
+  const cH = H - PAD_T - PAD_B;
+
+  // Y range
+  const hrs   = data.map(d => d.hr);
+  const minHR = Math.max(0,  Math.floor(Math.min(...hrs) / 5) * 5 - 5);
+  const maxHR = Math.ceil(Math.max(...hrs) / 5) * 5 + 5;
+  const yScale = v => PAD_T + cH - ((v - minHR) / (maxHR - minHR)) * cH;
+
+  // X range — use seconds values
+  const minSec = data[0].seconds;
+  const maxSec = data[data.length - 1].seconds;
+  const xScale = s => PAD_L + ((s - minSec) / (maxSec - minSec)) * cW;
+
+  // Background
+  ctx.fillStyle = '#161b22';
+  ctx.fillRect(0, 0, W, H);
+
+  // Sleep window shading
+  const sx1 = xScale(res.sleepStartSec);
+  const sx2 = xScale(res.sleepEndSec);
+  ctx.fillStyle = 'rgba(88,166,255,0.05)';
+  ctx.fillRect(sx1, PAD_T, sx2 - sx1, cH);
+  // Sleep window border lines
+  ctx.strokeStyle = 'rgba(88,166,255,0.2)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 4]);
+  ctx.beginPath(); ctx.moveTo(sx1, PAD_T); ctx.lineTo(sx1, PAD_T + cH); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(sx2, PAD_T); ctx.lineTo(sx2, PAD_T + cH); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Horizontal grid lines + Y labels
+  const gridVals = [];
+  for (let v = Math.ceil(minHR / 10) * 10; v <= maxHR; v += 10) gridVals.push(v);
+  ctx.font = `${9 * dpr / dpr}px 'DM Mono', monospace`;
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  gridVals.forEach(v => {
+    const y = yScale(v);
+    ctx.strokeStyle = 'rgba(42,52,65,0.8)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + cW, y); ctx.stroke();
+    ctx.fillStyle = '#4a5568';
+    ctx.fillText(v, PAD_L - 4, y);
+  });
+
+  // Threshold lines
+  const drawThresh = (val, color, label) => {
+    const y = yScale(val);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 0.7;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + cW, y); ctx.stroke();
+    ctx.setLineDash([]);
+  };
+  drawThresh(50,  'rgba(63,185,80,0.35)',   '50');
+  drawThresh(65,  'rgba(212,168,83,0.35)',  '65');
+
+  // Downsample for canvas: max ~2000 visual points to keep it fast
+  const SAMPLES = Math.min(data.length, 2000);
+  const step    = data.length / SAMPLES;
+  const pts     = [];
+  for (let i = 0; i < SAMPLES; i++) {
+    const d = data[Math.round(i * step)];
+    pts.push({ x: xScale(d.seconds), y: yScale(d.hr), hr: d.hr });
+  }
+
+  // Draw line segments colored by HR value
+  const colorFor = hr => hr <= 50 ? '#3fb950' : hr <= 65 ? '#d4a853' : '#f85149';
+
+  ctx.lineWidth   = 1.4;
+  ctx.lineJoin    = 'round';
+  ctx.lineCap     = 'round';
+
+  for (let i = 1; i < pts.length; i++) {
+    const p = pts[i - 1], q = pts[i];
+    ctx.strokeStyle = colorFor((p.hr + q.hr) / 2);
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(q.x, q.y);
+    ctx.stroke();
+  }
+
+  // X axis time labels
+  const totalSecs = maxSec - minSec;
+  const labelCount = Math.min(8, Math.floor(cW / 70));
+  ctx.fillStyle = '#4a5568';
+  ctx.font = `9px 'DM Mono', monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let i = 0; i <= labelCount; i++) {
+    const s   = minSec + (totalSecs * i / labelCount);
+    const x   = xScale(s);
+    const hh  = Math.floor(s / 3600).toString().padStart(2, '0');
+    const mm  = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
+    ctx.fillText(`${hh}:${mm}`, x, PAD_T + cH + 6);
+  }
+
+  // Sleep window annotation
+  const fmtTime2 = s => {
+    const h = Math.floor(s/3600).toString().padStart(2,'0');
+    const m = Math.floor((s%3600)/60).toString().padStart(2,'0');
+    return `${h}:${m}`;
+  };
+  document.getElementById('chartSleepNote').textContent =
+    `Sleep window: ${fmtTime2(res.sleepStartSec)} → ${fmtTime2(res.sleepEndSec)}${res.sleepEndEstimated ? '  (end estimated — recording cutoff)' : '  (shaded region)'}`;
+}
+
+// ─── JSONBIN STORAGE ───────────────────────────────────────────────────────────
+const JSONBIN_API_KEY  = '$2a$10$skpdub81XihiG.L60/oeAeFrdwRGREoI/hDa/mrpLjj.nO1IbuJGu';
+const JSONBIN_BASE_URL = 'https://api.jsonbin.io/v3/b';
+const JSONBIN_BIN_ID   = '69aeb1d4ae596e708f7061a0';
+const MAX_SAVED        = 3;
+
+async function getBinId() {
+  return JSONBIN_BIN_ID;
+}
+
+async function getSavedReports() {
+  try {
+    const id  = await getBinId();
+    if (!id) return [];
+    const res  = await fetch(`${JSONBIN_BASE_URL}/${id}/latest`, {
+      headers: { 'X-Master-Key': JSONBIN_API_KEY }
+    });
+    const data = await res.json();
+    const rec  = data.record;
+    // Support both {reports:[]} and plain [] formats
+    return Array.isArray(rec) ? rec : (rec && Array.isArray(rec.reports) ? rec.reports : []);
+  } catch(e) {
+    console.warn('Could not load reports from JSONBin:', e);
+    return [];
+  }
+}
+
+async function saveReportToStorage(report) {
+  try {
+    const id      = await getBinId();
+    if (!id) return;
+    const saved   = await getSavedReports();
+    const deduped = saved.filter(r => r.filename !== report.filename);
+    const updated = [report, ...deduped].slice(0, MAX_SAVED);
+    await fetch(`${JSONBIN_BASE_URL}/${id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type':     'application/json',
+        'X-Master-Key':     JSONBIN_API_KEY,
+        'X-Bin-Versioning': 'false'
+      },
+      body: JSON.stringify({ reports: updated })
+    });
+  } catch(e) {
+    console.warn('Could not save report to JSONBin:', e);
+  }
+}
+
+// ─── RECENT REPORTS UI ─────────────────────────────────────────────────────────
+async function loadRecentReports() {
+  const saved = await getSavedReports();
+  const wrap  = document.getElementById('recentReports');
+  const list  = document.getElementById('recentReportsList');
+  if (!saved.length) { wrap.style.display = 'none'; return; }
+
+  list.innerHTML = '';
+  saved.forEach(r => {
+    const pillKeys  = [0, 1, 2, 3];
+    const pillsHTML = pillKeys.map(i => {
+      const bm  = BENCHMARKS[i];
+      const v   = r.values[i];
+      const cls = rateValue(v, bm, i);
+      const disp = bm.unit === '%' ? v.toFixed(1)+'%'
+                 : bm.unit === 'hrs' ? v.toFixed(2)+'h'
+                 : bm.unit === 'events' ? Math.round(v)
+                 : v.toFixed(1);
+      return `<span class="recent-mini-pill ${cls}">${bm.abbr} ${disp}</span>`;
+    }).join('');
+
+    const item = document.createElement('div');
+    item.className = 'recent-report-item';
+    item.innerHTML = `
+      <div class="recent-report-left">
+        <div class="recent-report-name">${r.filename}</div>
+        <div class="recent-report-date">${r.date}</div>
+      </div>
+      <div class="recent-report-pills">${pillsHTML}</div>
+      <div class="recent-report-arrow">›</div>
+    `;
+    item.addEventListener('click', () => restoreReport(r));
+    list.appendChild(item);
+  });
+
+  wrap.style.display = 'block';
+}
+
+function restoreReport(r) {
+  document.getElementById('dropZone').style.display      = 'none';
+  document.getElementById('recentReports').style.display = 'none';
+  document.getElementById('errorBox').style.display      = 'none';
+  setProcessing(false);
+
+  const values = r.values;
+
+  document.getElementById('rFileName').textContent = r.filename;
+  document.getElementById('rDate').textContent     = r.date;
+
+  // Score pills
+  const scoreRow = document.getElementById('scoreRow');
+  scoreRow.innerHTML = '';
+  for (const i of [0,1,2,3]) {
+    const bm  = BENCHMARKS[i];
+    const v   = values[i];
+    const cls = rateValue(v, bm, i);
+    const pill = document.createElement('div');
+    pill.className = `score-pill ${cls}`;
+    pill.innerHTML = `
+      <div class="score-pill-label">${bm.abbr}</div>
+      <div class="score-pill-value">${bm.unit==='%'?v.toFixed(1):bm.unit==='hrs'?v.toFixed(2):bm.unit==='events'?Math.round(v):v.toFixed(1)}</div>
+      <div class="score-pill-unit">${bm.unit}</div>
+    `;
+    scoreRow.appendChild(pill);
+  }
+
+  // Table
+  const tbody = document.getElementById('tableBody');
+  tbody.innerHTML = '';
+  BENCHMARKS.forEach((bm, i) => {
+    const v   = values[i];
+    const cls = rateValue(v, bm, i);
+    const label = cls === 'good' ? '✓ On Target' : cls === 'warn' ? '△ Near Avg' : '✗ Below Avg';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="td-metric">${bm.metric}<small>${bm.desc}</small></td>
+      <td class="td-num">${fmtVal(bm.base, bm.unit)}</td>
+      <td class="td-num">${fmtVal(bm.target, bm.unit)}</td>
+      <td class="td-today val-${cls}">${fmtVal(v, bm.unit)}<span class="badge ${cls}">${label}</span></td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  // Footer
+  document.getElementById('reportFooter').innerHTML = r.footerHTML;
+
+  document.getElementById('reportDiv').style.display = 'block';
+
+  // Restore chart-section HTML in case it was previously replaced
+  const chartSection = document.querySelector('.chart-section');
+  if (chartSection && !chartSection.querySelector('#hrChart')) {
+    chartSection.innerHTML = `
+      <div class="chart-header">
+        <div class="chart-title">Heart Rate — Full Recording</div>
+        <div class="chart-legend">
+          <span><span class="legend-dot" style="background:#3fb950;width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px;"></span>≤ 50 BPM</span>
+          <span><span class="legend-dot" style="background:#d4a853;width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px;"></span>51–65 BPM</span>
+          <span><span class="legend-dot" style="background:#f85149;width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px;"></span>&gt; 65 BPM</span>
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="hrChart"></canvas>
+      </div>
+      <div class="chart-sleep-note" id="chartSleepNote"></div>`;
+  }
+
+  // Render chart if data was stored
+  if (r.chartData && r.chartData.secData && r.chartData.secData.length > 0) {
+    requestAnimationFrame(() => renderChart(r.chartData));
+  } else {
+    const cs = document.querySelector('.chart-section');
+    if (cs) cs.innerHTML = `
+      <div style="text-align:center;padding:32px;font-family:'DM Mono',monospace;font-size:11px;color:var(--text-dim);letter-spacing:0.1em;">
+        CHART DATA NOT AVAILABLE · Re-upload the original CSV to view
+      </div>`;
+  }
+}
+
+// ─── INIT ──────────────────────────────────────────────────────────────────────
+loadRecentReports();
+</script>
+</body>
+</html>
